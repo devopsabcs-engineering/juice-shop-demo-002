@@ -1,0 +1,120 @@
+# Installed from Cad4DevOps samples/findings-push/github (AB#2371). Pushes Trivy SARIF to the DevOps Shield demo (VM 002).
+# Contract: docs/FINDINGS_INGEST_CONTRACT.md ("Push identity mapping", "Push transport and qualification").
+#
+# Runner: a private self-hosted Linux x64 runner that can reach DOS_API_ENDPOINT over HTTPS. Do not use an
+# ARC docker-in-docker scaleset for `trivy image`: container egress on those pods is unreliable (AB#1571,
+# AB#1687). Never attach this credentialed job to a runner that also serves fork pull requests.
+#
+# Repository configuration (Settings > Secrets and variables > Actions):
+#   secret   DOS_FINDINGS_INGEST_KEY   findings:ingest credential for this repository's scope
+#   variable DOS_API_ENDPOINT          https://... DevOps Shield API origin
+#   variable DOS_TRIVY_IMAGE           image reference to scan, ideally pinned by digest
+name: Trivy findings push (DevOps Shield)
+
+on:
+  push:
+    branches: [main]   # set to the repository default branch
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dos-trivy-findings-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  trivy-findings:
+    # Trusted events only: a push to, or a manual run by a writer on, the default branch. No pull_request trigger.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest   # public demo repository: GitHub-hosted minutes are free; no fork pull_request trigger
+    timeout-minutes: 30
+    env:
+      TRIVY_VERSION: "0.74.0"
+      TRIVY_SHA256: "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"   # trivy_0.74.0_Linux-64bit.tar.gz
+      DOS_CLI_VERSION: "6.0.187"   # first dos release with --default-branch and --require-succeeded (AB#2375)
+      DOS_CLI_SHA256: "6042ea8193914b4be8e080ecdd96c0dd0dd30bbfb97925c458db7d61fad5ae83"   # dos-6.0.187-linux-x64.tar.gz in SHA256SUMS
+      DOS_CLI_BASE_URL: "https://github.com/devopsshield/devops-shield/releases/download"
+      DOS_API_ENDPOINT: ${{ vars.DOS_API_ENDPOINT }}
+      DOS_TRIVY_IMAGE: ${{ vars.DOS_TRIVY_IMAGE }}
+      DOS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Trivy and dos CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          case "$DOS_API_ENDPOINT" in https://*) ;; *) echo "::error::DOS_API_ENDPOINT must be an https URL."; exit 1 ;; esac
+          [[ "$TRIVY_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Set TRIVY_SHA256."; exit 1; }
+          [[ "$DOS_CLI_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Set DOS_CLI_VERSION."; exit 1; }
+          [[ "$DOS_CLI_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Set DOS_CLI_SHA256."; exit 1; }
+          command -v jq > /dev/null || { echo "::error::jq is required on the runner."; exit 1; }
+          bin="$RUNNER_TEMP/dos-bin"
+          mkdir -p "$bin"
+          trivy_archive="$RUNNER_TEMP/trivy.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 300 \
+            -o "$trivy_archive" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          printf '%s  %s\n' "$TRIVY_SHA256" "$trivy_archive" | sha256sum --check --strict -
+          tar -xzf "$trivy_archive" -C "$bin" trivy
+          dos_archive="$RUNNER_TEMP/dos.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 300 \
+            -o "$dos_archive" "${DOS_CLI_BASE_URL}/v${DOS_CLI_VERSION}/dos-${DOS_CLI_VERSION}-linux-x64.tar.gz"
+          printf '%s  %s\n' "$DOS_CLI_SHA256" "$dos_archive" | sha256sum --check --strict -
+          tar -xzf "$dos_archive" -C "$bin"
+          chmod +x "$bin/trivy" "$bin/dos"
+          # An older CLI would silently ignore these flags, so refuse it rather than weaken the gate.
+          help="$("$bin/dos" findings import --help)"
+          for flag in --default-branch --require-succeeded; do
+            grep -q -- "$flag" <<< "$help" || { echo "::error::dos $DOS_CLI_VERSION lacks $flag."; exit 1; }
+          done
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Scan with Trivy (image and config)
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "$DOS_TRIVY_IMAGE" ] || { echo "::error::Set the DOS_TRIVY_IMAGE variable."; exit 1; }
+          # --exit-code 0: vulnerabilities do not fail the scan; a non-zero exit here is a scanner fault.
+          timeout 20m trivy image --format sarif --output trivy-image.sarif \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 0 --timeout 15m "$DOS_TRIVY_IMAGE"
+          timeout 10m trivy config --format sarif --output trivy-config.sarif \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 0 .
+          for report in trivy-image.sarif trivy-config.sarif; do
+            [ -s "$report" ] || { echo "::error::$report is missing or empty."; exit 1; }
+            jq -e '(.runs | type == "array") and (.runs | length >= 1)' "$report" > /dev/null \
+              || { echo "::error::$report is not SARIF with runs[]."; exit 1; }
+          done
+
+      - name: Push findings to DevOps Shield
+        shell: bash
+        env:
+          DOS_FINDINGS_INGEST_KEY: ${{ secrets.DOS_FINDINGS_INGEST_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          key_file="$RUNNER_TEMP/dos-findings-key"
+          trap 'rm -f "$key_file"' EXIT INT TERM
+          printf '%s' "$DOS_FINDINGS_INGEST_KEY" > "$key_file"
+          unset DOS_FINDINGS_INGEST_KEY
+          export DOS_API_KEY_FILE="$key_file"
+          # GITHUB_REPOSITORY, GITHUB_REF, GITHUB_SHA and GITHUB_RUN_ID are read by the CLI itself.
+          for spec in "trivy-image.sarif|trivy-image|container-image" "trivy-config.sarif|trivy-config|iac-config"; do
+            IFS='|' read -r report analysis_set category <<< "$spec"
+            read -r runs < <(jq '.runs | length' "$report")
+            timeout 15m dos findings import "$report" \
+              --endpoint "$DOS_API_ENDPOINT" \
+              --analysis-set "$analysis_set" --tool trivy --category "$category" \
+              --expected-run-count "$runs" --authoritative false \
+              --tool-version "$TRIVY_VERSION" --default-branch "$DOS_DEFAULT_BRANCH" \
+              --wait --require-succeeded --timeout 10m
+          done
+
+      - name: Remove credential file
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/dos-findings-key"
