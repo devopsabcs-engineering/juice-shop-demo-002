@@ -1,0 +1,158 @@
+# DevOps Shield - The ultimate DevSecOps platform designed to secure your DevOps.
+# https://devopsshield.com
+##############################################################
+# This is a DevOps Shield - Application Security - Code Security Template.
+
+# This workflow template uses tools that are not certified by DevOps Shield.
+# They are provided by a third-party and are governed by separate terms of service, privacy policy, and support documentation.
+
+# Use this workflow template for pushing hardcoded secret findings into DevOps Shield Findings.
+
+# DevOps Shield Workflow Template Details:
+# ------------------------------------------------------------
+# Code: GH_SS_GITLEAKS_DOS
+# Name: Gitleaks Secret Scanning to DevOps Shield Findings
+# DevSecOpsControls: SS
+# Provider: Gitleaks
+# Categories: Code Scanning, Secrets
+# Description:
+# Scans the checked-out working tree for hardcoded secrets with a pinned, checksum-verified Gitleaks release,
+# redacts every secret value from the report before it leaves the runner, and pushes the SARIF report to
+# DevOps Shield Findings with a pinned, checksum-verified dos CLI under the gitleaks tool.
+# The import is non-authoritative, and the job fails unless the import reaches Succeeded.
+# Runs only on trusted default-branch events. Uploading to the GitHub Security tab is optional and off by default.
+# For more information:
+# https://github.com/gitleaks/gitleaks
+# Version: 1.0.0
+# Lifecycle: Active
+# CompatibilityTier: Expected
+# SupportedPlatforms: Linux
+# SupportedLanguages: Any
+# ------------------------------------------------------------
+# Source repository: https://github.com/gitleaks/gitleaks
+##############################################################
+
+# Repository configuration (Settings > Secrets and variables > Actions):
+#   secret   DOS_FINDINGS_KEY            findings:ingest credential for this repository's scope
+#   variable DOS_API_ENDPOINT            https:// origin of the DevOps Shield API, reachable from the runner
+#   variable DOS_FINDINGS_ANALYSIS_SET   optional analysis set name; defaults to ci
+# Set DOS_CLI_VERSION and DOS_CLI_SHA256 below before the first run: the job fails closed while they are empty.
+
+name: Gitleaks Secret Scanning to DevOps Shield Findings
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dos-gitleaks-findings-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gitleaks-findings:
+    name: Gitleaks findings push
+    # Trusted events only: no pull_request trigger, and only the default branch.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"   # gitleaks_8.30.1_linux_x64.tar.gz
+      DOS_CLI_VERSION: "6.0.187"     # REQUIRED: a dos release that supports --default-branch and --require-succeeded
+      DOS_CLI_SHA256: "6042ea8193914b4be8e080ecdd96c0dd0dd30bbfb97925c458db7d61fad5ae83"      # REQUIRED: dos-<version>-linux-x64.tar.gz entry from that release's SHA256SUMS
+      DOS_CLI_BASE_URL: "https://github.com/devopsshield/devops-shield/releases/download"
+      DOS_API_ENDPOINT: ${{ vars.DOS_API_ENDPOINT }}
+      DOS_FINDINGS_ANALYSIS_SET: ${{ vars.DOS_FINDINGS_ANALYSIS_SET }}
+      DOS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Gitleaks and dos CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          case "$DOS_API_ENDPOINT" in https://*) ;; *) echo "::error::DOS_API_ENDPOINT must be an https URL."; exit 1 ;; esac
+          [[ "$GITLEAKS_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Set GITLEAKS_SHA256."; exit 1; }
+          [[ "$DOS_CLI_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Set DOS_CLI_VERSION."; exit 1; }
+          [[ "$DOS_CLI_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Set DOS_CLI_SHA256."; exit 1; }
+          command -v jq > /dev/null || { echo "::error::jq is required on the runner."; exit 1; }
+          bin="$RUNNER_TEMP/dos-bin"
+          mkdir -p "$bin"
+          gitleaks_archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 300 \
+            -o "$gitleaks_archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$gitleaks_archive" | sha256sum --check --strict -
+          tar -xzf "$gitleaks_archive" -C "$bin" gitleaks
+          dos_archive="$RUNNER_TEMP/dos.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 300 \
+            -o "$dos_archive" "${DOS_CLI_BASE_URL}/v${DOS_CLI_VERSION}/dos-${DOS_CLI_VERSION}-linux-x64.tar.gz"
+          printf '%s  %s\n' "$DOS_CLI_SHA256" "$dos_archive" | sha256sum --check --strict -
+          tar -xzf "$dos_archive" -C "$bin"
+          chmod +x "$bin/gitleaks" "$bin/dos"
+          # An older CLI would silently ignore these flags, so refuse it rather than weaken the gate.
+          help="$("$bin/dos" findings import --help)"
+          for flag in --default-branch --require-succeeded; do
+            grep -q -- "$flag" <<< "$help" || { echo "::error::dos $DOS_CLI_VERSION lacks $flag."; exit 1; }
+          done
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Scan for secrets with Gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --redact keeps secret values out of the report; --exit-code 0: leaks do not fail the scan.
+          timeout 10m gitleaks dir . --report-format sarif --report-path gitleaks.sarif \
+            --redact --exit-code 0 --no-banner
+          report=gitleaks.sarif
+          [ -s "$report" ] || { echo "::error::$report is missing or empty."; exit 1; }
+          jq -e '(.runs | type == "array") and (.runs | length >= 1)' "$report" > /dev/null \
+            || { echo "::error::$report is not SARIF with runs[]."; exit 1; }
+
+      - name: Push findings to DevOps Shield
+        shell: bash
+        env:
+          DOS_FINDINGS_KEY: ${{ secrets.DOS_FINDINGS_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          analysis_set="${DOS_FINDINGS_ANALYSIS_SET:-ci}"
+          [[ "$analysis_set" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "::error::The analysis set name is invalid."; exit 1; }
+          umask 077
+          key_file="$RUNNER_TEMP/dos-findings-key"
+          trap 'rm -f "$key_file"' EXIT INT TERM
+          printf '%s' "$DOS_FINDINGS_KEY" > "$key_file"
+          unset DOS_FINDINGS_KEY
+          [ -s "$key_file" ] || { echo "::error::The findings credential secret is not set."; exit 1; }
+          export DOS_API_KEY_FILE="$key_file"
+          report=gitleaks.sarif
+          # GITHUB_REPOSITORY, GITHUB_REF, GITHUB_SHA and GITHUB_RUN_ID are read by the CLI itself.
+          read -r runs < <(jq '.runs | length' "$report")
+          timeout 15m dos findings import "$report" \
+            --endpoint "$DOS_API_ENDPOINT" \
+            --analysis-set "$analysis_set" --tool gitleaks --category secrets \
+            --expected-run-count "$runs" --authoritative false \
+            --tool-version "$GITLEAKS_VERSION" --default-branch "$DOS_DEFAULT_BRANCH" \
+            --wait --require-succeeded --timeout 10m
+
+      # Optional and off by default: also upload to the GitHub Security tab. Uncomment it, and add
+      # "security-events: write" to the workflow permissions, only where code scanning is enabled.
+      # - name: Upload SARIF to GitHub code scanning
+      #   uses: github/codeql-action/upload-sarif@v3
+      #   with:
+      #     sarif_file: gitleaks.sarif
+      #     category: gitleaks/
+
+      - name: Remove credential file
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/dos-findings-key"
